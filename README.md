@@ -146,6 +146,28 @@ A Model Context Protocol (MCP) server that provides comprehensive Trello integra
 
 6. **Restart your MCP client** to pick up the new configuration.
 
+## Trello OAuth helper (hosted/web)
+
+This fork includes a lightweight OAuth helper server for hosted usage.
+
+- It renders an auth form that asks for your **Trello API key**
+- It provides a **dropdown** for token validity:
+  - `1 day`, `1 week`, `1 month`, `6 months`, `1 year`, `always`
+- It redirects to Trello authorize, then stores the session in an HTTP-only cookie
+- It exposes `GET /session` so your host integration can read the authenticated `apiKey` + `token`
+
+### Run OAuth helper locally
+
+```bash
+node oauth-server.mjs
+```
+
+Optional environment variables:
+
+- `PORT` (default: `8080`)
+- `APP_BASE_URL` (default: `http://localhost:<PORT>`)
+- `TRELLO_API_KEY` (prefills the API key field)
+
 ## Available Tools
 
 The MCP server provides 19 tools organized into three phases:

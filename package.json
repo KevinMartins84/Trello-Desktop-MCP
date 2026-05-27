@@ -5,11 +5,13 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
+    "start": "node oauth-server.mjs",
     "build": "tsc",
     "clean": "rm -rf dist",
     "rebuild": "npm run clean && npm run build",
     "type-check": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "start:oauth": "node oauth-server.mjs"
   },
   "keywords": [
     "mcp",
