@@ -4,6 +4,9 @@ package-lock.json
 
 # Build output
 dist/
+bin/
+obj/
+host/**/App_Data/
 
 # Environment variables
 .env

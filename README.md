@@ -146,27 +146,38 @@ A Model Context Protocol (MCP) server that provides comprehensive Trello integra
 
 6. **Restart your MCP client** to pick up the new configuration.
 
-## Trello OAuth helper (hosted/web)
+## Remote MCP + OAuth (Claude / Cursor)
 
-This fork includes a lightweight OAuth helper server for hosted usage.
+Hosted entry point: **`host/TrelloMcp.Web`** — ASP.NET MCP server with the same OAuth pattern as [developer.kevinmartins.nl](https://developer.kevinmartins.nl) Telegram MCP.
 
-- It renders an auth form that asks for your **Trello API key**
-- It provides a **dropdown** for token validity:
-  - `1 day`, `1 week`, `1 month`, `6 months`, `1 year`, `always`
-- It redirects to Trello authorize, then stores the session in an HTTP-only cookie
-- It exposes `GET /session` so your host integration can read the authenticated `apiKey` + `token`
+### Claude custom connector
 
-### Run OAuth helper locally
+1. **MCP URL:** `https://<your-host>/mcp`
+2. Advanced → **OAuth Client ID:** `trello` (any string)
+3. Advanced → **OAuth Client Secret:** same value as server `McpOAuth:SharedSecret` / env `McpOAuth__SharedSecret`
+4. **Connect** → login page asks for **Trello API key** + validity (**1 day** … **always**) → approve on Trello → return to Claude
 
-```bash
-node oauth-server.mjs
+OAuth metadata: `https://<your-host>/oauth/.well-known/oauth-authorization-server`
+
+### Run locally
+
+```powershell
+$env:McpOAuth__SharedSecret = 'your-claude-connector-secret'
+$env:McpOAuth__PublicBaseUrl = 'http://localhost:5088'
+dotnet run --project host/TrelloMcp.Web
 ```
 
-Optional environment variables:
+### Deploy to Azure
 
-- `PORT` (default: `8080`)
-- `APP_BASE_URL` (default: `http://localhost:<PORT>`)
-- `TRELLO_API_KEY` (prefills the API key field)
+```powershell
+$env:MCP_OAUTH_SHARED_SECRET = 'your-claude-connector-secret'
+$env:TRELLO_API_KEY = 'optional-prefill'
+./scripts/deploy-trello-mcp-oauth-azure.ps1
+```
+
+Requires `az login` as **mail@kevinmartins.nl**.
+
+Legacy `oauth-server.mjs` (Node-only helper, **not** Claude-compatible) remains for reference.
 
 ## Available Tools
 
