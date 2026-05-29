@@ -48,21 +48,36 @@ public sealed class TrelloMcpOAuthServer
 
     private readonly McpOAuthSettings _settings;
     private readonly TrelloCredentialStore _credentials;
+    private readonly McpRefreshTokenStore _refreshTokens;
+    private readonly TrelloOAuth1Client _trelloOAuth1;
     private readonly RSA _rsa;
     private readonly string _keyId;
     private readonly ConcurrentDictionary<string, AuthorizationCodeEntry> _authCodes = new();
-    private readonly ConcurrentDictionary<string, RefreshTokenEntry> _refreshTokens = new();
     private readonly ConcurrentDictionary<string, ClientRegistration> _clients = new();
     private readonly ConcurrentDictionary<string, PendingOAuthSession> _pendingOAuth = new();
     private readonly ConcurrentDictionary<string, PendingTrelloLogin> _pendingTrello = new();
 
+    private static readonly Dictionary<string, string> TrelloOAuthExpiration = new(StringComparer.Ordinal)
+    {
+        ["1d"] = "1day",
+        ["1w"] = "30days",
+        ["1m"] = "30days",
+        ["6m"] = "never",
+        ["1y"] = "never",
+        ["always"] = "never",
+    };
+
     public TrelloMcpOAuthServer(
         IOptions<McpOAuthSettings> settings,
         TrelloCredentialStore credentials,
+        McpRefreshTokenStore refreshTokens,
+        TrelloOAuth1Client trelloOAuth1,
         McpOAuthSigningKeyStore signingKeyStore)
     {
         _settings = settings.Value;
         _credentials = credentials;
+        _refreshTokens = refreshTokens;
+        _trelloOAuth1 = trelloOAuth1;
         var material = signingKeyStore.GetMaterial();
         _rsa = material.Rsa;
         _keyId = material.KeyId;
@@ -84,9 +99,11 @@ public sealed class TrelloMcpOAuthServer
             registration_endpoint = $"{Issuer}/register",
             response_types_supported = new[] { "code" },
             grant_types_supported = new[] { "authorization_code", "refresh_token" },
-            token_endpoint_auth_methods_supported = new[] { "client_secret_post", "client_secret_basic", "none" },
+            token_endpoint_auth_methods_supported = new[] { "none" },
             code_challenge_methods_supported = new[] { "S256" },
             scopes_supported = Scopes,
+            subject_types_supported = new[] { "public" },
+            id_token_signing_alg_values_supported = new[] { "RS256" },
         });
 
     public IResult HandleProtectedResourceMetadata() =>
@@ -144,6 +161,11 @@ public sealed class TrelloMcpOAuthServer
             ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(15),
         };
 
+        if (!TryGetTrelloAppCredentials(out _, out var configError))
+        {
+            return Results.Content(configError!, "text/html; charset=utf-8");
+        }
+
         return Results.Content(BuildLoginHtml(sessionId), "text/html; charset=utf-8");
     }
 
@@ -151,8 +173,12 @@ public sealed class TrelloMcpOAuthServer
     {
         var form = await context.Request.ReadFormAsync(context.RequestAborted).ConfigureAwait(false);
         var sessionId = form["sid"].ToString();
-        var apiKey = form["apiKey"].ToString().Trim();
         var duration = form["duration"].ToString().Trim();
+
+        if (!TryGetTrelloAppCredentials(out var appCreds, out var configError))
+        {
+            return Results.Content(configError!, "text/html");
+        }
 
         if (string.IsNullOrWhiteSpace(sessionId) || !_pendingOAuth.TryGetValue(sessionId, out var pending))
         {
@@ -165,60 +191,59 @@ public sealed class TrelloMcpOAuthServer
             return Results.Content("<p class=\"error\">Session expired.</p>", "text/html");
         }
 
-        if (string.IsNullOrWhiteSpace(apiKey))
-        {
-            return Results.Content("<p class=\"error\">Trello API key is required.</p>", "text/html");
-        }
-
         if (!DurationLabels.ContainsKey(duration))
         {
             duration = "1w";
         }
 
         var trelloSid = GenerateToken();
+        var callbackUrl = $"{Issuer}/trello/oauth1/callback?sid={Uri.EscapeDataString(trelloSid)}";
+
+        OAuthTokenPair requestToken;
+        try
+        {
+            requestToken = await _trelloOAuth1.GetRequestTokenAsync(
+                appCreds.ApiKey,
+                appCreds.OAuthSecret,
+                callbackUrl,
+                context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return Results.Content(
+                "<p class=\"error\">Could not start Trello OAuth 1.0a. Check API key, secret, and allowed origins on trello.com/power-ups/admin.</p>" +
+                $"<p class=\"muted\">{System.Net.WebUtility.HtmlEncode(ex.Message)}</p>",
+                "text/html");
+        }
+
         _pendingTrello[trelloSid] = new PendingTrelloLogin
         {
             OAuthSessionId = sessionId,
-            ApiKey = apiKey,
+            ApiKey = appCreds.ApiKey,
             Duration = duration,
+            RequestToken = requestToken.Token,
+            RequestTokenSecret = requestToken.TokenSecret,
             ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(15),
         };
 
-        var expires = duration == "always" ? "never" : DurationSeconds[duration].ToString();
-        var authorizeUrl = new UriBuilder("https://trello.com/1/authorize")
+        var expiration = TrelloOAuthExpiration.GetValueOrDefault(duration, "30days");
+        var authorizeUrl = new UriBuilder("https://trello.com/1/OAuthAuthorizeToken")
         {
             Query = string.Join("&", new[]
             {
-                $"key={Uri.EscapeDataString(apiKey)}",
+                $"oauth_token={Uri.EscapeDataString(requestToken.Token)}",
                 "name=" + Uri.EscapeDataString("Trello MCP OAuth"),
                 "scope=" + Uri.EscapeDataString("read,write"),
-                $"expiration={Uri.EscapeDataString(expires)}",
-                "response_type=token",
-                "callback_method=fragment",
-                $"return_url={Uri.EscapeDataString($"{Issuer}/trello/callback?sid={Uri.EscapeDataString(trelloSid)}")}",
+                $"expiration={Uri.EscapeDataString(expiration)}",
+                $"return_url={Uri.EscapeDataString(callbackUrl)}",
             }),
         };
 
         return Results.Redirect(authorizeUrl.ToString());
     }
 
-    public IResult HandleTrelloCallback(string? sid, string? token)
+    public async Task<IResult> HandleTrelloOAuth1CallbackAsync(string? sid, string? oauthToken, string? oauthVerifier)
     {
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            var encodedSid = Uri.EscapeDataString(sid ?? string.Empty);
-            var callbackBase = $"{Issuer}/trello/callback";
-            return Results.Content(
-                "<!doctype html><html><body><p>Finalizing Trello sign-in…</p><script>" +
-                "const hash=new URLSearchParams(window.location.hash.slice(1));" +
-                "const token=hash.get('token');" +
-                "if(!token){document.body.innerHTML='<p style=\"color:#991b1b\">Token not found.</p>';}" +
-                "else{const u=new URL('" + callbackBase + "');u.searchParams.set('sid','" + encodedSid + "');" +
-                "u.searchParams.set('token',token);window.location.replace(u.toString());}" +
-                "</script></body></html>",
-                "text/html; charset=utf-8");
-        }
-
         if (string.IsNullOrWhiteSpace(sid) || !_pendingTrello.TryRemove(sid, out var trelloPending))
         {
             return Results.Content("<p class=\"error\">Trello session expired.</p>", "text/html");
@@ -229,15 +254,47 @@ public sealed class TrelloMcpOAuthServer
             return Results.Content("<p class=\"error\">OAuth session expired. Reconnect from Claude.</p>", "text/html");
         }
 
+        if (string.IsNullOrWhiteSpace(oauthToken) || string.IsNullOrWhiteSpace(oauthVerifier))
+        {
+            return Results.Content("<p class=\"error\">Trello authorization was denied or incomplete.</p>", "text/html");
+        }
+
+        if (!TryGetTrelloAppCredentials(out var appCreds, out var configError))
+        {
+            return Results.Content(configError!, "text/html");
+        }
+
+        OAuthTokenPair accessToken;
+        try
+        {
+            accessToken = await _trelloOAuth1.GetAccessTokenAsync(
+                appCreds.ApiKey,
+                appCreds.OAuthSecret,
+                oauthToken,
+                trelloPending.RequestTokenSecret,
+                oauthVerifier).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            return Results.Content(
+                "<p class=\"error\">Could not complete Trello OAuth 1.0a token exchange.</p>" +
+                $"<p class=\"muted\">{System.Net.WebUtility.HtmlEncode(ex.Message)}</p>",
+                "text/html");
+        }
+
         _pendingOAuth.TryRemove(trelloPending.OAuthSessionId, out _);
 
         var expiresAt = trelloPending.Duration == "always"
             ? (DateTimeOffset?)null
             : DateTimeOffset.UtcNow.AddSeconds(DurationSeconds[trelloPending.Duration]);
 
-        _credentials.Set(oauthPending.ClientId, trelloPending.ApiKey, token, expiresAt);
+        _credentials.Set(oauthPending.ClientId, appCreds.ApiKey, accessToken.Token, expiresAt);
 
-        var code = GenerateToken();
+        return Results.Redirect(BuildClaudeCallbackUrl(oauthPending, GenerateToken()));
+    }
+
+    private string BuildClaudeCallbackUrl(PendingOAuthSession oauthPending, string code)
+    {
         _authCodes[code] = new AuthorizationCodeEntry
         {
             ClientId = oauthPending.ClientId,
@@ -248,25 +305,17 @@ public sealed class TrelloMcpOAuthServer
             ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(10),
         };
 
-        var location = QueryHelpers.AddQueryString(oauthPending.RedirectUri, new Dictionary<string, string?>
+        return QueryHelpers.AddQueryString(oauthPending.RedirectUri, new Dictionary<string, string?>
         {
             ["code"] = code,
             ["state"] = oauthPending.State,
             ["iss"] = Issuer,
         });
-
-        return Results.Redirect(location);
     }
 
     public async Task<IResult> HandleTokenAsync(HttpContext context)
     {
         var form = await context.Request.ReadFormAsync(context.RequestAborted).ConfigureAwait(false);
-        if (!ValidateClientSecret(context, form))
-        {
-            context.Response.Headers.WWWAuthenticate = "Basic realm=\"mcp\"";
-            return Results.Json(new { error = "invalid_client" }, statusCode: StatusCodes.Status401Unauthorized);
-        }
-
         var clientId = GetClientId(context, form);
         if (string.IsNullOrWhiteSpace(clientId))
         {
@@ -301,30 +350,30 @@ public sealed class TrelloMcpOAuthServer
             return Results.Json(new { error = "invalid_redirect_uri" }, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        foreach (var uri in request.RedirectUris)
+        var acceptedRedirectUris = request.RedirectUris
+            .Where(IsAllowedRedirectUri)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (acceptedRedirectUris.Count == 0)
         {
-            if (!IsAllowedRedirectUri(uri))
-            {
-                return Results.Json(new { error = "invalid_redirect_uri", error_description = uri }, statusCode: StatusCodes.Status400BadRequest);
-            }
+            return Results.Json(
+                new { error = "invalid_redirect_uri", error_description = "No acceptable redirect URI was provided." },
+                statusCode: StatusCodes.Status400BadRequest);
         }
 
         var clientId = $"dyn-{Guid.NewGuid():N}";
-        var clientSecret = GenerateToken();
         _clients[clientId] = new ClientRegistration
         {
             ClientId = clientId,
-            ClientSecret = clientSecret,
-            RedirectUris = request.RedirectUris.ToHashSet(StringComparer.Ordinal),
+            RedirectUris = acceptedRedirectUris.ToHashSet(StringComparer.Ordinal),
         };
 
         return Results.Json(new
         {
             client_id = clientId,
-            client_secret = clientSecret,
             client_id_issued_at = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            redirect_uris = request.RedirectUris,
-            token_endpoint_auth_method = "client_secret_post",
+            redirect_uris = acceptedRedirectUris,
+            token_endpoint_auth_method = "none",
         });
     }
 
@@ -332,8 +381,6 @@ public sealed class TrelloMcpOAuthServer
     {
         var options = string.Join('\n', DurationLabels.Select(kv =>
             $"<option value=\"{kv.Key}\">{kv.Value}</option>"));
-
-        var defaultKey = System.Net.WebUtility.HtmlEncode(_settings.DefaultTrelloApiKey);
 
         var encodedSession = System.Net.WebUtility.HtmlEncode(sessionId);
         return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
@@ -345,17 +392,39 @@ public sealed class TrelloMcpOAuthServer
             "button{margin-top:16px;background:#2563eb;color:#fff;border:0;font-weight:600;cursor:pointer}" +
             ".muted{color:#6b7280;font-size:13px;margin-top:12px}</style></head><body><main class=\"card\">" +
             "<h1>Connect Trello to MCP</h1>" +
-            "<p>Enter your Trello API key and how long the token should stay valid. You will approve access on Trello, then return to Claude automatically.</p>" +
+            "<p>Choose how long access should remain valid, then approve on Trello. You will return to Claude automatically.</p>" +
             $"<form method=\"post\" action=\"{Issuer}/trello/start\">" +
             $"<input type=\"hidden\" name=\"sid\" value=\"{encodedSession}\" />" +
-            "<label for=\"apiKey\">Trello API key</label>" +
-            $"<input id=\"apiKey\" name=\"apiKey\" required value=\"{defaultKey}\" />" +
             "<label for=\"duration\">Authentication validity</label>" +
             $"<select id=\"duration\" name=\"duration\">{options}</select>" +
             "<button type=\"submit\">Continue to Trello</button></form>" +
-            "<p class=\"muted\">Get your API key at <a href=\"https://trello.com/app-key\" target=\"_blank\" rel=\"noopener\">trello.com/app-key</a>.</p>" +
             "</main></body></html>";
     }
+
+    private bool TryGetTrelloAppCredentials(out TrelloAppCredentials creds, out string? errorHtml)
+    {
+        var apiKey = _settings.DefaultTrelloApiKey?.Trim() ?? string.Empty;
+        var secret = _settings.TrelloOAuthSecret?.Trim() ?? string.Empty;
+
+        if (!IsPlausibleTrelloApiKey(apiKey) || string.IsNullOrWhiteSpace(secret))
+        {
+            creds = default;
+            errorHtml =
+                "<!doctype html><html><body style=\"font-family:Segoe UI,Arial,sans-serif;padding:24px\">" +
+                "<h1>Trello MCP is not configured</h1>" +
+                "<p>Set <code>McpOAuth__DefaultTrelloApiKey</code> and <code>McpOAuth__TrelloOAuthSecret</code> on the server " +
+                "(Power-Up API key + OAuth secret from <a href=\"https://trello.com/power-ups/admin\">trello.com/power-ups/admin</a>).</p>" +
+                "<p>Also add this allowed origin: <code>" + System.Net.WebUtility.HtmlEncode(_settings.GetOAuthIssuerUrl().Replace("/oauth", "", StringComparison.Ordinal)) + "</code></p>" +
+                "</body></html>";
+            return false;
+        }
+
+        creds = new TrelloAppCredentials(apiKey, secret);
+        errorHtml = null;
+        return true;
+    }
+
+    private readonly record struct TrelloAppCredentials(string ApiKey, string OAuthSecret);
 
     private (IResult? Error, string? RedirectUri) ValidateAuthorizeRequest(
         string? clientId,
@@ -440,7 +509,7 @@ public sealed class TrelloMcpOAuthServer
     private IResult HandleRefreshGrant(IFormCollection form, string clientId)
     {
         var refresh = form["refresh_token"].ToString();
-        if (string.IsNullOrWhiteSpace(refresh) || !_refreshTokens.TryRemove(refresh, out var entry))
+        if (string.IsNullOrWhiteSpace(refresh) || !_refreshTokens.TryTake(refresh, out var entry) || entry is null)
         {
             return Results.Json(new { error = "invalid_grant" }, statusCode: StatusCodes.Status400BadRequest);
         }
@@ -457,12 +526,7 @@ public sealed class TrelloMcpOAuthServer
     {
         var accessToken = CreateJwt(clientId, scopes);
         var refreshToken = GenerateToken();
-        _refreshTokens[refreshToken] = new RefreshTokenEntry
-        {
-            ClientId = clientId,
-            Scopes = scopes,
-            ExpiresAtUtc = DateTimeOffset.UtcNow.AddDays(90),
-        };
+        _refreshTokens.Save(refreshToken, clientId, scopes, DateTimeOffset.UtcNow.AddDays(90));
 
         return new
         {
@@ -497,38 +561,6 @@ public sealed class TrelloMcpOAuthServer
         }
 
         return handler.WriteToken(handler.CreateToken(descriptor));
-    }
-
-    private bool ValidateClientSecret(HttpContext context, IFormCollection form)
-    {
-        var configured = _settings.SharedSecret?.Trim();
-        if (string.IsNullOrWhiteSpace(configured))
-        {
-            return true;
-        }
-
-        var secret = form["client_secret"].ToString();
-        if (string.IsNullOrWhiteSpace(secret)
-            && context.Request.Headers.Authorization.Count > 0
-            && AuthenticationHeaderValue.TryParse(context.Request.Headers.Authorization.ToString(), out var auth)
-            && string.Equals(auth.Scheme, "Basic", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(auth.Parameter ?? string.Empty));
-                var colon = decoded.IndexOf(':');
-                if (colon > 0)
-                {
-                    secret = decoded[(colon + 1)..];
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        return string.Equals(secret, configured, StringComparison.Ordinal);
     }
 
     private static string? GetClientId(HttpContext context, IFormCollection form)
@@ -577,6 +609,33 @@ public sealed class TrelloMcpOAuthServer
             });
     }
 
+    private static bool IsPlausibleTrelloApiKey(string? apiKey)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            return false;
+        }
+
+        var key = apiKey.Trim();
+        if (key.Length is < 20 or > 128)
+        {
+            return false;
+        }
+
+        if (key.Contains(' ') || key.Contains("--", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (key.Contains("Specify", StringComparison.OrdinalIgnoreCase)
+            || key.Contains("available options", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     private static bool IsAllowedRedirectUri(string? redirectUri)
     {
         if (string.IsNullOrWhiteSpace(redirectUri) || !Uri.TryCreate(redirectUri, UriKind.Absolute, out var uri))
@@ -584,13 +643,22 @@ public sealed class TrelloMcpOAuthServer
             return false;
         }
 
+        if (string.Equals(uri.Scheme, "cursor", StringComparison.OrdinalIgnoreCase)
+            && uri.Host.Equals("anysphere.cursor-mcp", StringComparison.OrdinalIgnoreCase)
+            && uri.AbsolutePath.Equals("/oauth/callback", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
         if (uri.Scheme != "https" && uri.Scheme != "http")
         {
             return false;
         }
 
-        if (ClaudeRedirectHosts.Contains(uri.Host)
-            && uri.AbsolutePath.StartsWith("/api/mcp/auth_callback", StringComparison.OrdinalIgnoreCase))
+        var isClaudeHost = ClaudeRedirectHosts.Contains(uri.Host)
+            || uri.Host.EndsWith(".claude.ai", StringComparison.OrdinalIgnoreCase)
+            || uri.Host.EndsWith(".claude.com", StringComparison.OrdinalIgnoreCase);
+        if (isClaudeHost && uri.AbsolutePath.StartsWith("/api/mcp/auth_callback", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
@@ -652,17 +720,9 @@ public sealed class TrelloMcpOAuthServer
         public required DateTimeOffset ExpiresAtUtc { get; init; }
     }
 
-    private sealed class RefreshTokenEntry
-    {
-        public required string ClientId { get; init; }
-        public required IReadOnlyList<string> Scopes { get; init; }
-        public required DateTimeOffset ExpiresAtUtc { get; init; }
-    }
-
     private sealed class ClientRegistration
     {
         public required string ClientId { get; init; }
-        public string? ClientSecret { get; init; }
         public HashSet<string> RedirectUris { get; init; } = new(StringComparer.Ordinal);
     }
 
@@ -687,6 +747,8 @@ public sealed class TrelloMcpOAuthServer
         public required string OAuthSessionId { get; init; }
         public required string ApiKey { get; init; }
         public required string Duration { get; init; }
+        public required string RequestToken { get; init; }
+        public required string RequestTokenSecret { get; init; }
         public required DateTimeOffset ExpiresAtUtc { get; init; }
     }
 }

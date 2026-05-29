@@ -1,11 +1,13 @@
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.Extensions.Options;
 
 namespace TrelloMcp.Web.Mcp;
 
 public sealed class McpOAuthSigningKeyStore
 {
     private readonly IDataProtector _protector;
+    private readonly McpOAuthSettings _settings;
     private readonly string _keyFile;
     private readonly string _idFile;
     private readonly ILogger<McpOAuthSigningKeyStore> _logger;
@@ -13,13 +15,14 @@ public sealed class McpOAuthSigningKeyStore
 
     public McpOAuthSigningKeyStore(
         IDataProtectionProvider dataProtection,
+        IOptions<McpOAuthSettings> settings,
         IWebHostEnvironment env,
         ILogger<McpOAuthSigningKeyStore> logger)
     {
         _logger = logger;
+        _settings = settings.Value;
         _protector = dataProtection.CreateProtector("TrelloMcp.Web.McpOAuth.SigningKey.v1");
-        var dir = Path.Combine(env.ContentRootPath, "App_Data");
-        Directory.CreateDirectory(dir);
+        var dir = McpDataPaths.GetRoot(env);
         _keyFile = Path.Combine(dir, "mcp-oauth-signing.dp");
         _idFile = Path.Combine(dir, "mcp-oauth-keyid.txt");
     }
@@ -28,6 +31,26 @@ public sealed class McpOAuthSigningKeyStore
 
     private SigningKeyMaterial LoadOrCreate()
     {
+        var configuredKey = _settings.SigningKeyPkcs8Base64?.Trim();
+        if (!string.IsNullOrWhiteSpace(configuredKey))
+        {
+            try
+            {
+                var privateKey = Convert.FromBase64String(configuredKey);
+                var rsa = RSA.Create();
+                rsa.ImportPkcs8PrivateKey(privateKey, out _);
+                var keyId = string.IsNullOrWhiteSpace(_settings.SigningKeyId)
+                    ? "configured"
+                    : _settings.SigningKeyId.Trim();
+                _logger.LogInformation("Using MCP OAuth signing key from configuration (kid {KeyId}).", keyId);
+                return new SigningKeyMaterial(rsa, keyId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "McpOAuth:SigningKeyPkcs8Base64 is invalid; falling back to persisted/generated key.");
+            }
+        }
+
         if (File.Exists(_keyFile) && File.Exists(_idFile))
         {
             try

@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.Net.Http.Headers;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
@@ -14,9 +15,10 @@ public static class McpOAuthEndpointExtensions
     public static IServiceCollection AddTrelloMcpOAuth(this IServiceCollection services, IConfiguration configuration)
     {
         services.Configure<McpOAuthSettings>(configuration.GetSection(McpOAuthSettings.SectionName));
-        services.AddDataProtection();
         services.AddSingleton<McpOAuthSigningKeyStore>();
         services.AddSingleton<TrelloCredentialStore>();
+        services.AddSingleton<McpRefreshTokenStore>();
+        services.AddSingleton<TrelloOAuth1Client>();
         services.AddSingleton<TrelloMcpOAuthServer>();
         services.AddSingleton<IPostConfigureOptions<JwtBearerOptions>, TrelloMcpJwtBearerOptionsConfigurer>();
         services.AddHttpContextAccessor();
@@ -59,7 +61,9 @@ public static class McpOAuthEndpointExtensions
         var oauthPath = settings.OAuthPath.TrimEnd('/');
         var mcpPath = settings.McpPath.TrimEnd('/');
 
+        app.MapGet("/.well-known/oauth-protected-resource", oauth.HandleProtectedResourceMetadata);
         app.MapGet($"{mcpPath}/.well-known/oauth-protected-resource", oauth.HandleProtectedResourceMetadata);
+        app.MapGet("/.well-known/oauth-authorization-server", oauth.HandleAuthorizationServerMetadata);
         app.MapGet($"{oauthPath}/.well-known/oauth-authorization-server", oauth.HandleAuthorizationServerMetadata);
         app.MapGet($"{oauthPath}/.well-known/openid-configuration", oauth.HandleAuthorizationServerMetadata);
         app.MapGet($"{oauthPath}/.well-known/jwks.json", oauth.HandleJwks);
@@ -77,7 +81,8 @@ public static class McpOAuthEndpointExtensions
 
         app.MapPost($"{oauthPath}/trello/start", async (HttpContext ctx, TrelloMcpOAuthServer server) =>
             await server.HandleTrelloStartAsync(ctx).ConfigureAwait(false));
-        app.MapGet($"{oauthPath}/trello/callback", (string? sid, string? token) => oauth.HandleTrelloCallback(sid, token));
+        app.MapGet($"{oauthPath}/trello/oauth1/callback", async (string? sid, string? oauth_token, string? oauth_verifier, TrelloMcpOAuthServer server) =>
+            await server.HandleTrelloOAuth1CallbackAsync(sid, oauth_token, oauth_verifier).ConfigureAwait(false));
 
         app.MapPost($"{oauthPath}/token", async (HttpContext ctx, TrelloMcpOAuthServer server) =>
             await server.HandleTokenAsync(ctx).ConfigureAwait(false));
@@ -88,7 +93,9 @@ public static class McpOAuthEndpointExtensions
     }
 }
 
-internal sealed class TrelloMcpJwtBearerOptionsConfigurer(TrelloMcpOAuthServer oauthServer) : IPostConfigureOptions<JwtBearerOptions>
+internal sealed class TrelloMcpJwtBearerOptionsConfigurer(
+    TrelloMcpOAuthServer oauthServer,
+    IOptions<McpOAuthSettings> settings) : IPostConfigureOptions<JwtBearerOptions>
 {
     public void PostConfigure(string? name, JwtBearerOptions options)
     {
@@ -108,6 +115,16 @@ internal sealed class TrelloMcpJwtBearerOptionsConfigurer(TrelloMcpOAuthServer o
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = oauthServer.SigningKey,
             NameClaimType = JwtRegisteredClaimNames.Sub,
+        };
+
+        var challenge = McpOAuthDiscovery.BuildWwwAuthenticate(settings.Value);
+        options.Events = new JwtBearerEvents
+        {
+            OnChallenge = context =>
+            {
+                context.Response.Headers[HeaderNames.WWWAuthenticate] = challenge;
+                return Task.CompletedTask;
+            },
         };
     }
 }

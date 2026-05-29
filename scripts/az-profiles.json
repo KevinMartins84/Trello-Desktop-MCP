@@ -1,0 +1,23 @@
+{
+  "personal": {
+    "label": "mail@kevinmartins.nl",
+    "user": "mail@kevinmartins.nl",
+    "tenantId": "bdb23b29-b442-408b-af3c-95472e911e1b",
+    "subscriptionId": "8f1b040d-a65c-472b-b1f9-bbeac43b0956",
+    "subscriptionName": "Betalen per gebruik"
+  },
+  "zineps": {
+    "label": "kevin@zineps.com",
+    "user": "kevin@zineps.com",
+    "tenantId": "7c826390-f31e-4e3a-af61-85d2035a6e03",
+    "subscriptionName": "Azure subscription 1"
+  },
+  "etesian": {
+    "label": "kevin.martins@etesian.nl",
+    "user": "kevin.martins@etesian.nl"
+  },
+  "ifaktor": {
+    "label": "kevinmartins@ifaktor.nl",
+    "user": "kevinmartins@ifaktor.nl"
+  }
+}

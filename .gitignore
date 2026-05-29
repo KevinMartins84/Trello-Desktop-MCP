@@ -1,58 +1,30 @@
-# Dependencies
-node_modules/
-package-lock.json
-
-# Build output
-dist/
+# Build
 bin/
 obj/
-host/**/App_Data/
+**/App_Data/
 
-# Environment variables
+# Secrets
 .env
-.env.local
-.env.*.local
+.env.*
+.deploy-secret.local
+.trello-mcp.azure.env
+scripts/trello-mcp.local.env
+.env.credentials
+*.credentials.json
+*secret*.local
+*apikey*.local
 
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# IDE
+.vs/
+.vscode/
+.idea/
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Test files
-coverage/
-.nyc_output/
-*.test.js
-*.spec.js
-
-# Temporary files
+# Logs / temp
+logs/
+*.log
 tmp/
 temp/
-*.tmp
-
-# Claude specific
-.claude/
-claude-desktop-config.json
-claude-desktop-config-*.json
-
-# Local configuration
-*.local.json
-config.local.json
-
-# Credentials (extra safety)
-*credentials*
-*secret*
-*token*
-*apikey*
