@@ -22,6 +22,12 @@ public sealed class McpOAuthSettings
     /// <summary>JWT <c>kid</c> when <see cref="SigningKeyPkcs8Base64"/> is set.</summary>
     public string SigningKeyId { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Multipart upload endpoint that returns JSON with a public <c>url</c> field.
+    /// Used by attachment download rehosting so agents can open private Trello files.
+    /// </summary>
+    public string ArtifactUploadUrl { get; set; } = "https://developer.kevinmartins.nl/api/artifacts";
+
     public string GetMcpResourceUrl() => $"{PublicBaseUrl.TrimEnd('/')}{McpPath}";
 
     public string GetOAuthIssuerUrl() => $"{PublicBaseUrl.TrimEnd('/')}{OAuthPath}";
